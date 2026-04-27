@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """QQ Bot platform adapter for hermes-agent.
 
-Thin hermes-specific layer on top of the ``core/`` SDK.  All QQ Bot protocol
-logic lives in ``core/``; this file is responsible only for:
+Thin hermes-specific layer on top of ``qqbot-agent-sdk``.  All QQ Bot protocol
+logic lives in the SDK; this file is responsible only for:
 
-1. Reading hermes config and constructing core components with injected deps.
+1. Reading hermes config and constructing SDK components with injected deps.
 2. Implementing the :class:`~gateway.platforms.base.BasePlatformAdapter`
    interface (``connect``, ``disconnect``, ``send``, ``send_image``, …).
-3. Converting :class:`~core.event_parser.InboundEvent` →
+3. Converting :class:`~qqbot_agent_sdk.InboundEvent` →
    :class:`~gateway.platforms.base.MessageEvent` (≈ 30 lines).
-4. Wrapping core results in :class:`~gateway.platforms.base.SendResult`.
+4. Wrapping SDK results in :class:`~gateway.platforms.base.SendResult`.
 
 Configuration in config.yaml::
 
@@ -40,7 +40,6 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -65,51 +64,72 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    _ssrf_redirect_guard,
-    cache_image_from_url,
 )
 from gateway.platforms.helpers import strip_markdown
 
-from .core.api_client import QQApiClient
-from .core.approval import (
+from qqbot_agent_sdk import (
+    QQApiClient,
     ApprovalRequest,
     ApprovalSender,
     build_update_prompt_keyboard,
     parse_approval_button_data,
     parse_update_prompt_button_data,
-)
-from .core.attachment_processor import (
     AttachmentDownloader,
     AttachmentProcessor,
     ProcessedAttachment,
-    STTPipeline,
-)
-from .core.audio import resolve_stt_config
-from .core.constants import (
+    configure as configure_sdk,
+    resolve_stt_config,
     MAX_MESSAGE_LENGTH,
     MEDIA_TYPE_FILE,
     MEDIA_TYPE_IMAGE,
     MEDIA_TYPE_VIDEO,
     MEDIA_TYPE_VOICE,
-)
-from .core.dto import (
     GuildMessageToCreate,
     InputNotify,
     MessageToCreate,
     QQMessageType,
     parse_interaction_event,
-)
-from .core.event_parser import EventParser, InboundEvent
-from .core.media_loader import (
+    EventParser,
+    InboundEvent,
     MediaLoader,
     MediaUploader,
     UploadDailyLimitExceededError,
     UploadFileTooLargeError,
+    coerce_list,
+    QQCloseError,
+    QQWebSocket,
+    WSCallbacks,
+    append_block,
+    describe_attachment,
+    entry_matches,
+    is_fatal_send_error,
+    parse_qq_timestamp,
+    DEFAULT_INTENTS,
+    EventType,
+    MediaInfo,
+    MSG_TYPE_QUOTE,
+    WSSessionStore,
 )
-from .core.utils import coerce_list
-from .core.websocket import QQCloseError, QQWebSocket, WSCallbacks
+from qqbot_agent_sdk.attachment import _ssrf_redirect_guard
+from qqbot_agent_sdk.audio import STTPipeline
 
 logger = logging.getLogger(__name__)
+
+
+# ── SDK configuration ─────────────────────────────────────────────────
+
+def _hermes_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("hermes-agent")
+    except Exception:
+        return "unknown"
+
+
+configure_sdk(
+    source="hermes",
+    extra_ua_items=[f"Hermes/{_hermes_version()}"],
+)
 
 
 # ── Dependency checks ─────────────────────────────────────────────────
@@ -124,7 +144,7 @@ def check_qq_requirements() -> bool:
 class QQAdapter(BasePlatformAdapter):
     """hermes QQ Bot adapter backed by the official QQ Bot WebSocket Gateway.
 
-    Delegates all QQ protocol logic to ``core/``.  This class is the
+    Delegates all QQ protocol logic to ``qqbot-agent-sdk``.  This class is the
     sole file that may import from ``gateway.platforms.base`` and other
     hermes modules.
     """
@@ -188,7 +208,6 @@ class QQAdapter(BasePlatformAdapter):
         self._downloader = AttachmentDownloader(
             http_client=None,
             cache_dir=self._get_cache_dir(),
-            media_headers_fn=self._media_headers,
             log_tag=self._log_tag,
         )
         self._stt = STTPipeline(
@@ -209,8 +228,6 @@ class QQAdapter(BasePlatformAdapter):
         self._approval_sender = ApprovalSender(self._api, log_tag=self._log_tag)
 
         # Session persistence — load previous session for Resume
-        from .core.session_store import WSSessionStore
-        from .core.dto import DEFAULT_INTENTS
         self._ws_session_store = WSSessionStore(self._get_cache_dir())
         self._intents = int(DEFAULT_INTENTS)
         persisted = self._ws_session_store.get(self._app_id)
@@ -537,9 +554,9 @@ class QQAdapter(BasePlatformAdapter):
         text = event.content
         for att in processed:
             if att.kind == "voice" and att.transcript:
-                text = _append_block(text, f"[Voice] {att.transcript}")
+                text = append_block(text, f"[Voice] {att.transcript}")
             elif att.description:
-                text = _append_block(text, att.description)
+                text = append_block(text, att.description)
 
         # Collect image paths
         image_urls = [a.local_path for a in processed if a.kind == "image" and a.local_path]
@@ -565,7 +582,7 @@ class QQAdapter(BasePlatformAdapter):
             message_id=event.message_id,
             media_urls=image_urls,
             media_types=image_types,
-            timestamp=self._parse_qq_timestamp(event.timestamp),
+            timestamp=parse_qq_timestamp(event.timestamp),
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
         )
@@ -579,8 +596,6 @@ class QQAdapter(BasePlatformAdapter):
         event: InboundEvent,
     ) -> Tuple[Optional[str], Optional[str]]:
         """Resolve quoted message elements into (ref_id, text) pair."""
-        from .core.dto import MSG_TYPE_QUOTE
-
         if event.message_type != MSG_TYPE_QUOTE or not event.msg_elements:
             return None, None
 
@@ -601,7 +616,7 @@ class QQAdapter(BasePlatformAdapter):
                     cached = await self._downloader.download(url, ct, fname)
                 except Exception as exc:
                     logger.debug("[%s] Failed to cache quoted attachment: %s", self._log_tag, exc)
-            parts.append(_describe_attachment(ct, fname, cached))
+            parts.append(describe_attachment(ct, fname, cached))
 
         body = " ".join(parts) if parts else "[empty message]"
         # Wrap in brackets to bypass found_in_history exact match constraint.
@@ -650,7 +665,7 @@ class QQAdapter(BasePlatformAdapter):
                 return await self._send_by_type(chat_type, chat_id, content, reply_to)
             except Exception as exc:
                 last_exc = exc
-                if self._is_fatal_send_error(str(exc)):
+                if is_fatal_send_error(str(exc)):
                     break
                 if attempt < 2:
                     delay = 1.0 * (2 ** attempt)
@@ -665,7 +680,7 @@ class QQAdapter(BasePlatformAdapter):
         return SendResult(
             success=False,
             error=error_msg,
-            retryable=not self._is_fatal_send_error(error_msg),
+            retryable=not is_fatal_send_error(error_msg),
         )
 
     async def _send_by_type(
@@ -873,7 +888,6 @@ class QQAdapter(BasePlatformAdapter):
             msg_id=reply_to or "",
             content=caption[: self.MAX_MESSAGE_LENGTH] if caption else "",
         )
-        from .core.dto import MediaInfo
         send_msg.media = MediaInfo(file_info=file_info)
 
         send_path = (
@@ -1011,7 +1025,7 @@ class QQAdapter(BasePlatformAdapter):
         def _write() -> None:
             store.save(
                 app_id=app_id,
-                session_id=session_id,
+                session=session_id,
                 seq=seq,
                 intents=intents,
                 bot_username=bot_username,
@@ -1030,14 +1044,11 @@ class QQAdapter(BasePlatformAdapter):
     def _guess_chat_type(self, chat_id: str) -> str:
         return self._chat_type_map.get(chat_id, "c2c")
 
-    def _media_headers(self) -> Dict[str, str]:
-        return self._api.media_headers()
-
     def _is_dm_allowed(self, user_id: str) -> bool:
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
-            return _entry_matches(self._allow_from, user_id)
+            return entry_matches(self._allow_from, user_id)
         return True
 
     def _is_group_allowed(self, group_id: str, user_id: str) -> bool:
@@ -1045,57 +1056,29 @@ class QQAdapter(BasePlatformAdapter):
         if self._group_policy == "disabled":
             return False
         if self._group_policy == "allowlist":
-            return _entry_matches(self._group_allow_from, group_id)
+            return entry_matches(self._group_allow_from, group_id)
         return True
 
     def _check_acl(self, event: InboundEvent) -> bool:
-        from .core.dto import EventType
-
         if event.event_type == EventType.C2C_MESSAGE_CREATE:
             return self._is_dm_allowed(event.user_id)
         if event.event_type == EventType.GROUP_AT_MESSAGE_CREATE:
             return self._is_group_allowed(event.chat_id, event.user_id)
         return True
 
-    def _parse_qq_timestamp(self, raw: str) -> datetime:
-        if not raw:
-            return datetime.now(tz=timezone.utc)
-        try:
-            return datetime.fromisoformat(raw)
-        except (ValueError, TypeError):
-            pass
-        try:
-            return datetime.fromtimestamp(int(raw) / 1000, tz=timezone.utc)
-        except (ValueError, TypeError):
-            pass
-        return datetime.now(tz=timezone.utc)
-
-    @staticmethod
-    def _get_cache_dir() -> str:
-        """Return the hermes cache directory for QQ Bot media files."""
+    def _get_cache_dir(self) -> str:
+        """Return the hermes cache directory for this QQ Bot instance."""
         try:
             from hermes_constants import get_hermes_home
 
-            return str(get_hermes_home() / "cache" / "qqbot")
+            return str(get_hermes_home() / "cache" / "qqbot" / self._app_id)
         except Exception:
             import tempfile
 
             return str(tempfile.gettempdir())
 
-    @staticmethod
-    def _is_fatal_send_error(error_msg: str) -> bool:
-        lower = error_msg.lower()
-        return any(k in lower for k in ("invalid", "forbidden", "not found", "bad request"))
-
 
 # ── Module-level helpers ──────────────────────────────────────────────
-
-def _append_block(base: str, block: str) -> str:
-    """Append *block* to *base* with double-newline separator."""
-    if base.strip():
-        return (base + "\n\n" + block).strip()
-    return block
-
 
 def _detect_message_type(
     media_urls: List[str],
@@ -1116,22 +1099,107 @@ def _detect_message_type(
     return MessageType.TEXT
 
 
-def _describe_attachment(ct: str, fname: str, cached: Optional[str]) -> str:
-    """Build a text description for a quoted attachment."""
-    if ct.startswith("image/"):
-        return f"[image: {fname} ({cached})]" if cached else (f"[image: {fname}]" if fname else "[image]")
-    if "audio" in ct or "voice" in ct or "silk" in ct:
-        return f"[voice message ({cached})]" if cached else "[voice message]"
-    if ct.startswith("video/"):
-        return f"[video: {fname} ({cached})]" if cached else (f"[video: {fname}]" if fname else "[video]")
-    return f"[file: {fname} ({cached})]" if cached else (f"[file: {fname}]" if fname else "[attachment]")
+# ── Re-exports (QR-code onboard flow + SDK helpers) ───────────────────
+from qqbot_agent_sdk import (  # noqa: F401, E402
+    BindStatus,
+    build_connect_url,
+    start_onboard,
+    OnboardResult,
+    OnboardAPIError,
+    OnboardError,
+    OnboardExpiredError,
+    ONBOARD_POLL_INTERVAL,
+    QQCloseError,
+    coerce_list as _coerce_list,
+)
 
 
-def _entry_matches(entries: List[str], target: str) -> bool:
-    """Return True if *target* matches any entry in the allowlist."""
-    normalized = str(target).strip().lower()
-    for entry in entries:
-        e = str(entry).strip().lower()
-        if e in ("*", normalized):
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# Interactive QR registration (used by hermes_cli/gateway.py)
+# ---------------------------------------------------------------------------
+
+try:
+    import qrcode as _qrcode_mod
+except ImportError:
+    _qrcode_mod = None
+
+
+def _render_qr(url: str) -> bool:
+    """Try to render a QR code in the terminal.
+
+    :returns: ``True`` if the QR code was rendered successfully.
+    """
+    if _qrcode_mod is None:
+        return False
+    try:
+        qr = _qrcode_mod.QRCode(
+            error_correction=_qrcode_mod.constants.ERROR_CORRECT_M,
+            border=2,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+        return True
+    except Exception:
+        return False
+
+
+def _on_qr_ready(url: str) -> None:
+    """Callback for start_onboard: display the QR code URL to the user."""
+    print()
+    if _render_qr(url):
+        print(f"  Scan the QR code above, or open this URL directly:\n  {url}")
+    else:
+        print(f"  Open this URL in QQ on your phone:\n  {url}")
+        print("  Tip: pip install qrcode  to display a scannable QR code here")
+    print()
+
+
+_MAX_QR_REFRESHES = 3
+
+
+def qr_register(timeout_seconds: int = 600) -> Optional[dict]:
+    """Run the QQBot scan-to-configure QR registration flow.
+
+    Thin synchronous wrapper around :func:`qqbot_agent_sdk.start_onboard`.
+    Mirrors ``feishu.qr_register()`` interface for ``hermes_cli/gateway.py``.
+
+    Handles QR code expiry by re-creating the bind task up to
+    :data:`_MAX_QR_REFRESHES` times.
+
+    :param timeout_seconds: Total seconds before giving up.
+    :returns: ``{"app_id": ..., "client_secret": ..., "user_openid": ...}``
+        on success, or ``None`` on failure / expiry / cancellation.
+    """
+    for refresh in range(_MAX_QR_REFRESHES + 1):
+        try:
+            result: OnboardResult = asyncio.run(
+                start_onboard(
+                    on_qr_ready=_on_qr_ready,
+                    poll_timeout=float(timeout_seconds),
+                )
+            )
+            print()
+            print(f"  QR scan complete! (App ID: {result.app_id})")
+            if result.user_openid:
+                print(f"  Scanner's OpenID: {result.user_openid}")
+            return {
+                "app_id": result.app_id,
+                "client_secret": result.client_secret,
+                "user_openid": result.user_openid,
+            }
+        except OnboardExpiredError:
+            if refresh < _MAX_QR_REFRESHES:
+                print(f"\n  QR code expired, refreshing... ({refresh + 1}/{_MAX_QR_REFRESHES})")
+                continue
+            logger.warning("[QQBot onboard] QR code expired %d times — giving up", _MAX_QR_REFRESHES)
+            return None
+        except TimeoutError:
+            logger.warning("[QQBot onboard] Poll timed out after %ds", timeout_seconds)
+            return None
+        except (OnboardAPIError, OnboardError) as exc:
+            logger.warning("[QQBot onboard] Failed: %s", exc)
+            return None
+
+    return None
+

@@ -1505,7 +1505,7 @@ async def _send_qqbot(pconfig, chat_id, message, media_files=None):
         await adapter._api.ensure_token()
 
         try:
-            from gateway.platforms.qqbot.core.media_loader import (
+            from qqbot_agent_sdk import (
                 UploadDailyLimitExceededError,
                 UploadFileTooLargeError,
             )
@@ -1521,7 +1521,7 @@ async def _send_qqbot(pconfig, chat_id, message, media_files=None):
                     return _error(f"Media file not found: {media_path}")
                 ext = os.path.splitext(media_path)[1].lower()
                 try:
-                    from gateway.platforms.qqbot.core.constants import (
+                    from qqbot_agent_sdk import (
                         MEDIA_TYPE_FILE, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_VOICE,
                     )
 

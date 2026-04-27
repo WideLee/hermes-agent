@@ -131,7 +131,7 @@ class TestCoerceList:
 
 class TestIsVoiceContentType:
     def _fn(self, content_type, filename):
-        from gateway.platforms.qqbot.core.audio import is_voice_content_type
+        from qqbot_agent_sdk.audio import is_voice_content_type
         return is_voice_content_type(content_type, filename)
 
     def test_voice_content_type(self):
@@ -156,13 +156,12 @@ class TestIsVoiceContentType:
 
 class TestVoiceAttachmentSSRFProtection:
     def test_stt_blocks_unsafe_download_url(self):
-        from gateway.platforms.qqbot.core.attachment_processor import AttachmentDownloader
+        from qqbot_agent_sdk.attachment import AttachmentDownloader
 
         http_client = mock.AsyncMock()
         downloader = AttachmentDownloader(
             http_client=http_client,
             cache_dir="/tmp",
-            media_headers_fn=lambda: {},
             log_tag="test",
         )
 
@@ -182,7 +181,7 @@ class TestVoiceAttachmentSSRFProtection:
 
         fake_client = mock.MagicMock()
         fake_client.aclose = mock.AsyncMock()
-        with mock.patch("gateway.platforms.qqbot.adapter.httpx.AsyncClient", return_value=fake_client) as async_client_cls:
+        with mock.patch("gateway.platforms.qqbot.httpx.AsyncClient", return_value=fake_client) as async_client_cls:
             adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
             adapter._api.ensure_token = mock.AsyncMock(side_effect=RuntimeError("stop after client creation"))
 
@@ -200,7 +199,7 @@ class TestVoiceAttachmentSSRFProtection:
 
 class TestStripAtMention:
     def _fn(self, content):
-        from gateway.platforms.qqbot.core.event_parser import _strip_at_mention
+        from qqbot_agent_sdk.event_parser import _strip_at_mention
         return _strip_at_mention(content)
 
     def test_removes_mention(self):
@@ -276,12 +275,12 @@ class TestGroupAllowed:
 
 class TestResolveSTTConfig:
     def test_no_config(self):
-        from gateway.platforms.qqbot.core.audio import resolve_stt_config
+        from qqbot_agent_sdk.audio import resolve_stt_config
         with mock.patch.dict(os.environ, {}, clear=True):
             assert resolve_stt_config({}) is None
 
     def test_env_config(self):
-        from gateway.platforms.qqbot.core.audio import resolve_stt_config
+        from qqbot_agent_sdk.audio import resolve_stt_config
         with mock.patch.dict(os.environ, {
             "QQ_STT_API_KEY": "key123",
             "QQ_STT_BASE_URL": "https://example.com/v1",
@@ -289,12 +288,12 @@ class TestResolveSTTConfig:
         }, clear=True):
             cfg = resolve_stt_config({})
             assert cfg is not None
-            assert cfg["api_key"] == "key123"
-            assert cfg["base_url"] == "https://example.com/v1"
-            assert cfg["model"] == "my-model"
+            assert cfg.api_key == "key123"
+            assert cfg.base_url == "https://example.com/v1"
+            assert cfg.model == "my-model"
 
     def test_extra_config(self):
-        from gateway.platforms.qqbot.core.audio import resolve_stt_config
+        from qqbot_agent_sdk.audio import resolve_stt_config
         extra = {"stt": {
             "baseUrl": "https://custom.api/v4",
             "apiKey": "sk_extra",
@@ -303,9 +302,9 @@ class TestResolveSTTConfig:
         with mock.patch.dict(os.environ, {}, clear=True):
             cfg = resolve_stt_config(extra)
             assert cfg is not None
-            assert cfg["base_url"] == "https://custom.api/v4"
-            assert cfg["api_key"] == "sk_extra"
-            assert cfg["model"] == "glm-asr"
+            assert cfg.base_url == "https://custom.api/v4"
+            assert cfg.api_key == "sk_extra"
+            assert cfg.model == "glm-asr"
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +313,7 @@ class TestResolveSTTConfig:
 
 class TestDetectMessageType:
     def _fn(self, media_urls, media_types):
-        from gateway.platforms.qqbot.adapter import _detect_message_type
+        from gateway.platforms.qqbot import _detect_message_type
         return _detect_message_type(media_urls, media_types)
 
     def test_no_media(self):
@@ -400,36 +399,6 @@ class TestAdapterCallbacks:
         assert adapter.is_connected
         adapter._mark_disconnected()
         assert not adapter.is_connected
-
-
-# ---------------------------------------------------------------------------
-# _parse_json
-# ---------------------------------------------------------------------------
-
-class TestParseJson:
-    def _fn(self, raw):
-        from gateway.platforms.qqbot.core.websocket import QQWebSocket
-        return QQWebSocket._parse_json(raw)
-
-    def test_valid_json(self):
-        result = self._fn('{"op": 10, "d": {}}')
-        assert result == {"op": 10, "d": {}}
-
-    def test_invalid_json(self):
-        result = self._fn("not json")
-        assert result is None
-
-    def test_none_input(self):
-        result = self._fn(None)
-        assert result is None
-
-    def test_non_dict_json(self):
-        result = self._fn('"just a string"')
-        assert result is None
-
-    def test_empty_dict(self):
-        result = self._fn('{}')
-        assert result == {}
 
 
 # ---------------------------------------------------------------------------
